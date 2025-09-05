@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Secure E2EE Chat</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 900px;
+      margin: 20px;
+      background-color: aquamarine;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      margin: 8px 0;
+    }
+
+    textarea {
+      width: 100%;
+      height: 120px;
+    }
+
+    #log {
+      white-space: pre-wrap;
+      background: #c6bbbb;
+      padding: 10px;
+      border: 1px solid #000000;
+      max-height: 300px;
+      overflow: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Secure Chat App — E2EE</h2>
+
+  <div>
+    <label>You (username): <input id="username" /></label>
+    <button id="genkeys">Generate RSA Key Pair</button>
+    <button id="register" disabled>Register public key with server</button>
+  </div>
+
+  <div class="row">
+    <label>Send to (recipient username): <input id="recipient" /></label>
+  </div>
+
+  <div>
+    <textarea id="plaintext" placeholder="Type a message..."></textarea>
+  </div>
+
+  <div class="row">
+    <button id="send" disabled>Encrypt & Send</button>
+    <button id="fetchPub">Fetch recipient public key</button>
+    <button id="fetchLogs">Fetch my encrypted logs</button>
+  </div>
+
+  <h3>Activity / Messages</h3>
+  <div id="log"></div>
+
+  <script>
+    // ---------- Helpers ----------
+    function b64enc(buf) { return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+    function b64dec(s) { return new Uint8Array([...atob(s)].map(c => c.charCodeAt(0))); }
+
+    function str2ab(s) {
+      const enc = new TextEncoder();
+      return enc.encode(s);
+    }
+    function ab2str(buf) {
+      const dec = new TextDecoder();
+      return dec.decode(buf);
+    }
+
+    // ---------- Crypto functions ----------
+    const RSA_ALG = { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" };
+    const AES_ALG = { name: "AES-GCM", length: 256 };
+
+    let myKeyPair = null;   // {privateKey, publicKey}
+    let socket = null;
+    let myUsername = null;
+
+    async function generateRSA() {
+      myKeyPair = await window.crypto.subtle.generateKey(RSA_ALG, true, ["encrypt", "decrypt"]);
+      logToUI('RSA key pair generated (privateKey stays in browser).');
+      document.getElementById('register').disabled = false;
+      document.getElementById('send').disabled = false;
+    }
+
+    // Export public key as base64 SPKI
+    async function exportPublicKeyBase64() {
+      const spki = await crypto.subtle.exportKey('spki', myKeyPair.publicKey);
+      return b64enc(spki);
+    }
+
+    // Import recipient public key from base64 SPKI to CryptoKey
+    async function importRecipientPublicKey(b64spki) {
+      const raw = b64dec(b64spki).buffer;
+      return crypto.subtle.importKey('spki', raw, RSA_ALG, true, ['encrypt']);
+    }
+
+    // Encrypt a message for recipientPublicCryptoKey (CryptoKey RSA) using per-message AES-GCM
+    async function encryptForRecipient(recipientPublicCryptoKey, plaintext) {
+      // 1) generate AES key
+      const aesKey = await crypto.subtle.generateKey(AES_ALG, true, ['encrypt', 'decrypt']);
+      // 2) export raw AES key and encrypt it with recipient's RSA public key
+      const rawAes = await crypto.subtle.exportKey('raw', aesKey); // ArrayBuffer
+      const encryptedAesKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, recipientPublicCryptoKey, rawAes);
+
+      // 3) encrypt message with AES-GCM
+      const iv = window.crypto.getRandomValues(new Uint8Array(12)); // 96-bit
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, str2ab(plaintext));
+
+      return {
+        ciphertext: b64enc(ciphertext),
+        encryptedKey: b64enc(encryptedAesKey),
+        iv: b64enc(iv)
+      };
+    }
+
+    // Decrypt incoming message using my private RSA key
+    async function decryptIncoming(encryptedKeyB64, ciphertextB64, ivB64) {
+      // 1) decrypt AES key with private RSA key
+      const encAes = b64dec(encryptedKeyB64).buffer;
+      const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, myKeyPair.privateKey, encAes);
+      // import AES key
+      const aesKey = await crypto.subtle.importKey('raw', rawAes, AES_ALG, true, ['decrypt']);
+      // decrypt ciphertext
+      const ciphertext = b64dec(ciphertextB64).buffer;
+      const iv = b64dec(ivB64).buffer;
+      const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, aesKey, ciphertext);
+      return ab2str(plainBuf);
+    }
+
+    // ---------- UI / networking ----------
+    function logToUI(s) {
+      const d = document.getElementById('log');
+      d.textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + d.textContent;
+    }
+
+    document.getElementById('genkeys').onclick = async () => {
+      await generateRSA();
+    };
+
+    document.getElementById('register').onclick = async () => {
+      myUsername = document.getElementById('username').value.trim();
+      if (!myUsername) { alert('Enter your username'); return; }
+      const pubB64 = await exportPublicKeyBase64();
+      // send to server
+      const resp = await fetch('/api/pubkey', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: myUsername, publicKey: pubB64 })
+      });
+      if (resp.ok) {
+        logToUI('Public key registered with server.');
+        // open socket and join room
+        socket = io();
+        socket.on('connect', () => {
+          logToUI('Socket.IO connected.');
+          socket.emit('join', { username: myUsername });
+        });
+        socket.on('incoming_encrypted_message', async (payload) => {
+          logToUI('Encrypted message received from ' + payload.sender);
+          try {
+            const plain = await decryptIncoming(payload.encryptedKey, payload.ciphertext, payload.iv);
+            logToUI(`→ Decrypted from ${payload.sender}: ${plain}`);
+          } catch (e) {
+            console.error(e);
+            logToUI('ERROR decrypting incoming message.');
+          }
+        });
+        socket.on('status', d => logToUI('STATUS: ' + JSON.stringify(d)));
+      } else {
+        const t = await resp.text();
+        alert('Failed to register public key: ' + t);
+      }
+    };
+
+    document.getElementById('fetchPub').onclick = async () => {
+      const recip = document.getElementById('recipient').value.trim();
+      if (!recip) { alert('Enter recipient username'); return; }
+      const r = await fetch(`/api/pubkey/${encodeURIComponent(recip)}`);
+      if (!r.ok) { alert('Recipient public key not found'); return; }
+      const j = await r.json();
+      logToUI(`Fetched public key for ${recip}.`);
+      // display small preview
+      // (not stored locally except demonstration)
+    };
+
+    document.getElementById('send').onclick = async () => {
+      const recip = document.getElementById('recipient').value.trim();
+      const text = document.getElementById('plaintext').value;
+      if (!recip || !text) { alert('recipient and message required'); return; }
+      if (!myUsername) { alert('register first'); return; }
+      // fetch recipient public key from server
+      const r = await fetch(`/api/pubkey/${encodeURIComponent(recip)}`);
+      if (!r.ok) { alert('Recipient public key not found'); return; }
+      const j = await r.json();
+      const recipPubB64 = j.publicKey;
+      const recipPubKey = await importRecipientPublicKey(recipPubB64);
+      // encrypt with recipient
+      const enc = await encryptForRecipient(recipPubKey, text);
+      // attach sender metadata so recipient can know who sent it
+      const payload = { sender: myUsername, recipient: recip, ciphertext: enc.ciphertext, encryptedKey: enc.encryptedKey, iv: enc.iv };
+      // send via socket
+      socket.emit('encrypted_message', payload);
+      logToUI(`Encrypted message sent to ${recip}`);
+      document.getElementById('plaintext').value = '';
+    };
+
+    document.getElementById('fetchLogs').onclick = async () => {
+      const u = document.getElementById('username').value.trim();
+      if (!u) { alert('enter username'); return; }
+      const r = await fetch(`/api/logs/${encodeURIComponent(u)}`);
+      if (!r.ok) { alert('could not fetch logs'); return; }
+      const arr = await r.json();
+      logToUI('Fetched logs (encrypted): ' + JSON.stringify(arr, null, 2));
+    };
+
+  </script>
+</body>
+
+</html>
